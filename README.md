@@ -34,7 +34,7 @@
 基础操作，自行上网搜索即可。
 #### 2. 执行安装脚本。
 ```shell
-git clone https://github.com/你的用户名/powerrune26.git  # 替换为你的仓库地址
+git clone https://github.com/suiyi29/PowerRune26.git
 ```
 ```shell
 cd ./powerrune26/powerrune-26-Operator/
