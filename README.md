@@ -80,6 +80,8 @@ python pr-26-operator.py
 ![输入图片说明](Instruction02.png)
 - 大符运行时，可以手动观察大符的运行日志，分析击打结果。
 ![输入图片说明](Instruction03.png)
+- 若上位机出现卡退界面，点击右上角关闭即可。
+![输入图片说明](Instruction04.png)
 ### 4. OTA升级、参数整定
 该部分功能未在PowerRune Operator内开放。
 
