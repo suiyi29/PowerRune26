@@ -66,7 +66,9 @@ esp_err_t LED_Strip::rmt_new_led_strip_encoder(rmt_encoder_handle_t *ret_encoder
 {
     esp_err_t ret = ESP_OK;
     rmt_led_strip_encoder_t *led_encoder = NULL;
-    uint16_t reset_ticks = 250; // reset code duration defaults to 50us
+    // 检修优化: WS2812B 要求 >280us 的低电平才能锁存。RMT 分辨率 10MHz(0.1us/tick),
+    //   3000 tick = 300us。原来的 250(=25us) 远远不够 —— 与 Armour 那份对齐。
+    uint16_t reset_ticks = 3000;
 
     // different led strip might have its own timing requirements, following parameter is for WS2812
     rmt_bytes_encoder_config_t bytes_encoder_config = {
@@ -97,7 +99,11 @@ esp_err_t LED_Strip::rmt_new_led_strip_encoder(rmt_encoder_handle_t *ret_encoder
     ESP_GOTO_ON_ERROR(rmt_new_bytes_encoder(&bytes_encoder_config, &led_encoder->bytes_encoder), err, TAG_LED_STRIP, "create bytes encoder failed");
     ESP_GOTO_ON_ERROR(rmt_new_copy_encoder(&copy_encoder_config, &led_encoder->copy_encoder), err, TAG_LED_STRIP, "create copy encoder failed");
 
-    led_encoder->reset_code = {0, reset_ticks, 0, reset_ticks};
+    // 检修优化: 原来写成 {0, reset_ticks, 0, reset_ticks}。rmt_symbol_word_t 的字段顺序是
+    //   duration0 / level0 / duration1 / level1, 这样初始化等于 **两个 duration 都是 0、level 被赋成
+    //   reset_ticks** —— 复位脉冲实际长度为 0, 只靠两次刷新之间的天然空闲时间锁存。
+    //   {reset_ticks, 0, reset_ticks, 0} = 两段各 reset_ticks 个 tick 的低电平, 3000 tick = 300us (>280us)。
+    led_encoder->reset_code = {reset_ticks, 0, reset_ticks, 0};
     *ret_encoder = &led_encoder->base;
     return ESP_OK;
 err:

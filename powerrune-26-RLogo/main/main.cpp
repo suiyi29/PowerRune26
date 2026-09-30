@@ -191,6 +191,63 @@ void prm_speed_stable_event_handler(void *handler_args, esp_event_base_t base, i
 }
 
 /**
+ * @brief maintenance_task
+ * @note 检修模式: 命令全部 5 块装甲板常亮, 用于现场排障(查灯珠 / 查键轴)。
+ *
+ * 检修优化: 从 run_task 里拆出来成为独立任务。原来寄生在 run_task 里的实现有五个问题:
+ *   ① **不停电机** —— 只广播给装甲板, 没发 PRM_STOP_EVENT。运行中切检修, 转盘会继续按原速转;
+ *   ② **不接管 R 标灯效** —— led_animation_task 没被挂起, 流水灯还在跑, 与"检修"语义不符;
+ *   ③ **等待语义不一致** —— 直接用裸 xEventGroupWaitBits(500ms), 而全工程其余发送点都用
+ *      wait_espnow_ack_bounded()(1500ms); 且失败静默, 上位机看不出哪块板没响应;
+ *   ④ **寄生在 run_task 生命周期里** —— 进出都要走它的建/销流程(还带一处裸 return 的资源泄漏
+ *      和悬垂 run_task_handle);
+ *   ⑤ 退出后回 IDLE 可能画出上一轮残留的灯臂进度条。
+ *
+ * 本任务不建任何 queue / timer / semaphore, 所以收尾只需要 vTaskDelete(NULL)。
+ * 退出检修由"停止"按钮完成: stop_task -> 广播 PRA_STOP_EVENT -> 装甲板 stop() -> 回 IDLE。
+ */
+void maintenance_task(void *pvParameter)
+{
+    char log_string[100];
+    ESP_LOGW(TAG_MAIN, "=== MAINTENANCE MODE triggered by operator ===");
+    notify_ops(RUN_VAL, "=== MAINTENANCE MODE: All armours full ON ===");
+
+    // ① 先停电机(安全): 运行中切检修时转盘必须停下来
+    PRM_STOP_EVENT_DATA prm_stop_event_data;
+    esp_event_post_to(pr_events_loop_handle, PRM, PRM_STOP_EVENT, &prm_stop_event_data, sizeof(PRM_STOP_EVENT_DATA), portMAX_DELAY);
+    wait_espnow_ack_bounded();
+
+    // ② 接管 R 标灯效。判空理由同 run_task: led_animation_task 是 app_main 里、BLE 可连接
+    //    之后才创建的, vTaskSuspend(NULL) 会把调用者自己挂死。
+    if (led_animation_task_handle != NULL)
+        vTaskSuspend(led_animation_task_handle);
+    led_strip->set_color(0, config->get_config_info_pt()->brightness, 0); // 绿色常亮 = 检修态
+    led_strip->refresh();
+
+    // ③ 广播全亮命令, 用统一的"有上限等待"并统计失败台数
+    uint8_t failed = 0;
+    for (uint8_t addr = 0; addr < 5; addr++)
+    {
+        PRA_MAINTENANCE_EVENT_DATA maint_data = {
+            .address = addr,
+            .data_len = sizeof(PRA_MAINTENANCE_EVENT_DATA),
+        };
+        esp_event_post_to(pr_events_loop_handle, PRA, PRA_MAINTENANCE_EVENT, &maint_data, sizeof(PRA_MAINTENANCE_EVENT_DATA), portMAX_DELAY);
+        if (!wait_espnow_ack_bounded())
+            failed++;
+    }
+
+    // ④ 汇总上报(原来失败是静默的)
+    if (failed)
+        ESP_LOGE(TAG_MAIN, "Maintenance: %d/5 armours did not ACK", (int)failed);
+    sprintf(log_string, "Maintenance: %d/5 armours acked", (int)(5 - failed));
+    notify_ops(RUN_VAL, log_string);
+    ESP_LOGI(TAG_MAIN, "Maintenance command broadcast done, %d/5 acked", (int)(5 - failed));
+
+    vTaskDelete(NULL);
+}
+
+/**
  * @brief run_task
  * @note 大符运行任务代码
  */
@@ -211,24 +268,14 @@ void run_task(void *pvParameter)
     // 注册事件
     esp_ble_gatts_get_attr_value(ops_handle_table[RUN_VAL], &len, &value);
 
-    // === 检修模式: mode==2, 不启动电机, 广播全亮命令给所有装甲板 ===
-    if (value[1] == 2)
-    {
-        ESP_LOGW(TAG_MAIN, "=== MAINTENANCE MODE triggered by operator ===");
-        sprintf(log_string, "=== MAINTENANCE MODE: All armours full ON ===");
-        notify_ops(RUN_VAL, log_string);
-        for (uint8_t addr = 0; addr < 5; addr++)
-        {
-            PRA_MAINTENANCE_EVENT_DATA maint_data = {
-                .address = addr,
-                .data_len = sizeof(PRA_MAINTENANCE_EVENT_DATA),
-            };
-            esp_event_post_to(pr_events_loop_handle, PRA, PRA_MAINTENANCE_EVENT, &maint_data, sizeof(PRA_MAINTENANCE_EVENT_DATA), portMAX_DELAY);
-            xEventGroupWaitBits(espnow_protocol->send_state, espnow_protocol->SEND_ACK_OK_BIT, pdTRUE, pdTRUE, pdMS_TO_TICKS(500));
-        }
-        ESP_LOGI(TAG_MAIN, "Maintenance command broadcast to all 5 armours");
-        return;
-    }
+    // 检修优化: 检修模式(mode==2)已经从这里移出去了, 改由 gatts_profile_event_handler
+    //   在读到 value[1]==2 时直接起 maintenance_task。
+    //   原来放在这里有三个问题:
+    //     ① 上面刚建好的 run_queue / hit_timer / motor_done_sem 会被裸 return 全部泄漏,
+    //        且 run_task_handle 停在一个"已结束任务"的旧句柄上(下次按 RUN 会对它 vTaskDelete);
+    //     ② 进/出检修都要走 run_task 的建/销流程;
+    //     ③ 不停电机、不接管 R 标灯效。
+    //   本函数现在只处理大符/小符两种模式。
 
     ESP_LOGI(TAG_MAIN, "Run Triggered:");
     ESP_LOGI(TAG_MAIN, "Color : %s", value[0] ? "Blue" : "Red");
@@ -1333,6 +1380,19 @@ void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts
                 run_task_handle = NULL;
                 if (run_queue != NULL) { vQueueDelete(run_queue); run_queue = NULL; }
                 if (hit_timer != NULL) { xTimerDelete(hit_timer, portMAX_DELAY); hit_timer = NULL; }
+            }
+            // 检修优化: value[1]==2 是检修模式, 改走独立的 maintenance_task, 不再进 run_task。
+            //   (run_task 里已经不再处理 mode==2 —— 那边原来是裸 return, 会泄漏
+            //    run_queue/hit_timer/motor_done_sem 并把 run_task_handle 留成悬垂句柄。)
+            {
+                uint16_t run_value_len = 0;
+                const uint8_t *run_value = NULL;
+                esp_ble_gatts_get_attr_value(ops_handle_table[RUN_VAL], &run_value_len, &run_value);
+                if (run_value != NULL && run_value_len >= 2 && run_value[1] == 2)
+                {
+                    xTaskCreate((TaskFunction_t)maintenance_task, "maintenance_task", 4096, NULL, 10, NULL);
+                    break;
+                }
             }
             xTaskCreate((TaskFunction_t)run_task, "run_task", 4096, NULL, 10, &run_task_handle);
             break;

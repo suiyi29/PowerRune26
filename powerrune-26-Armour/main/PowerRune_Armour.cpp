@@ -293,26 +293,32 @@ void PowerRune_Armour::LED_update_task(void *pvParameter)
         }
         case LED_STRIP_MAINTENANCE:
         {
-            // 检修模式: 所有灯带全亮白色，循环刷新(不退出，重启即恢复正常模式)
-            const uint8_t bright = 80;
-            while (1)
+            // 检修优化: 原来是 while(1) 死循环, 而且循环体内 **不读 state** ——
+            //   进了检修就再也出不来: stop()/START/OTA_COMPLETE/失联(BEACON_TIMEOUT) 全都拉不动它,
+            //   只能切断大符电源重启。检修态下连"主控掉线自动回待机"这条保护也是失效的。
+            //   改成"刷一帧 + 带超时等信号量": 任何状态切换都会给信号量把它拉出来;
+            //   超时(MAINT_TIMEOUT_MS)则自己退回待机, 防"进了检修忘了退"导致全白常亮发热。
+            config_info = config->get_config_info_pt();
+            const uint8_t bright = config_info->brightness; // 检修优化: 走配置, 不再硬编码 80
+            static const uint8_t maint_strips[] = {
+                LED_STRIP_MAIN_ARMOUR, LED_STRIP_UPPER, LED_STRIP_LOWER,
+                LED_STRIP_ARM, LED_STRIP_MATRIX};
+            for (uint8_t s = 0; s < sizeof(maint_strips); s++)
             {
-                demux_led = LED_STRIP_MAIN_ARMOUR;
-                led_strip[LED_STRIP_MAIN_ARMOUR]->set_color(bright, bright, bright);
-                led_strip[LED_STRIP_MAIN_ARMOUR]->refresh();
-                demux_led = LED_STRIP_UPPER;
-                led_strip[LED_STRIP_UPPER]->set_color(bright, bright, bright);
-                led_strip[LED_STRIP_UPPER]->refresh();
-                demux_led = LED_STRIP_LOWER;
-                led_strip[LED_STRIP_LOWER]->set_color(bright, bright, bright);
-                led_strip[LED_STRIP_LOWER]->refresh();
-                demux_led = LED_STRIP_ARM;
-                led_strip[LED_STRIP_ARM]->set_color(bright, bright, bright);
-                led_strip[LED_STRIP_ARM]->refresh();
-                demux_led = LED_STRIP_MATRIX;
-                led_strip[LED_STRIP_MATRIX]->set_color(bright, bright, bright);
-                led_strip[LED_STRIP_MATRIX]->refresh();
-                vTaskDelay(50 / portTICK_PERIOD_MS);
+                demux_led = maint_strips[s];
+                led_strip[maint_strips[s]]->set_color(bright, bright, bright);
+                led_strip[maint_strips[s]]->refresh();
+            }
+            // 全白是静态画面, 不需要周期性重刷(原来每 50ms 重刷一遍 667 颗灯, 约 20ms/轮的 RMT 占用全是浪费)
+            if (xSemaphoreTake(LED_Strip_FSM_Semaphore, pdMS_TO_TICKS(MAINT_TIMEOUT_MS)) == pdTRUE)
+            {
+                state_task = state; // 被 STOP / START / OTA / 失联拉走, 正常转移
+            }
+            else
+            {
+                ESP_LOGW(TAG_ARMOUR, "Maintenance timeout, back to IDLE");
+                state.LED_Strip_State = LED_STRIP_IDLE; // 超时兜底
+                state_task = state;
             }
             break;
         }
@@ -364,15 +370,22 @@ void PowerRune_Armour::GPIO_polling_service(void *pvParameter)
 
     ESP_LOGI(TAG_ARMOUR, "GPIO polling service start");
     TickType_t start_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    // 检修模式检测: 启动后3秒内同一引脚连击5次进入全亮检修模式
+    // 检修优化: 原来是"启动后 3 秒内同一引脚连击 5 次进检修"。三个问题:
+    //   ① 窗口只有 3 秒, 实际操作几乎按不进去(要在 3 秒内对同一靶面精确敲 5 下);
+    //   ② maintenance_count 达标后不清零, 同一次连击会反复触发;
+    //   ③ 依赖 **全局** last_activation_time, 中途按了别的通道就把本通道计数打断。
+    //   现在: 窗口 MAINT_WINDOW_MS + per-channel 计时(间隔 120~600ms 才算连击)
+    //         + 达标清零 + toggle(再敲 5 下 = 退出检修)。
     uint8_t maintenance_count[10] = {0};
+    TickType_t maint_last_hit[10] = {0};
+    bool maint_armed = false; // toggle 闩锁: false = 常规, true = 检修中
     while (1)
     {
         TickType_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
         for (uint8_t i = 0; i < 10; i++)
         {
             int reading = gpio_get_level(TRIGGER_IO[i]);
-            bool in_maint_window = (current_time - start_time) < 3000; // 启动后3秒为检修模式检测窗口
+            bool in_maint_window = (current_time - start_time) < MAINT_WINDOW_MS; // 开机后本窗口内为检修模式检测窗口
             if (in_maint_window) { bounce_count[i] = 0; bounce_time[i] = current_time; } // 窗口内重置跳变计数，避免连击误触发损坏检测
 
             // 去抖动处理
@@ -396,12 +409,26 @@ void PowerRune_Armour::GPIO_polling_service(void *pvParameter)
                         activation_time[i] = current_time;
                         if (in_maint_window)
                         {
-                            maintenance_count[i]++;
+                            // per-channel 计时: 只有"距本通道上一次触发 120~600ms"才算一次连击。
+                            // 不再用全局 last_activation_time 作判据 —— 那会让"中途按了别的通道"打断计数。
+                            TickType_t gap = current_time - maint_last_hit[i];
+                            maintenance_count[i] = (gap >= 120 && gap <= 600) ? (uint8_t)(maintenance_count[i] + 1) : 1;
+                            maint_last_hit[i] = current_time;
                             ESP_LOGI(TAG_ARMOUR, "[Maintenance] GPIO %d hit %d/5", (int)TRIGGER_IO[i], maintenance_count[i]);
                             if (maintenance_count[i] >= 5)
                             {
-                                ESP_LOGW(TAG_ARMOUR, "=== Entering MAINTENANCE MODE ===");
-                                enter_maintenance();
+                                maintenance_count[i] = 0;   // 清零, 避免同一次连击被反复认作达标
+                                maint_armed = !maint_armed; // toggle
+                                if (maint_armed)
+                                {
+                                    ESP_LOGW(TAG_ARMOUR, "=== Entering MAINTENANCE MODE ===");
+                                    enter_maintenance();
+                                }
+                                else
+                                {
+                                    ESP_LOGW(TAG_ARMOUR, "=== Leaving MAINTENANCE MODE ===");
+                                    stop(); // 本地也能退出, 不必依赖上位机或重启
+                                }
                             }
                         }
                         else
@@ -419,7 +446,11 @@ void PowerRune_Armour::GPIO_polling_service(void *pvParameter)
             }
 
             // 持续低电平激活检测（检修窗口内禁用，避免连击误判损坏）
-            if (!in_maint_window && io_valid_state[i] == 0 && current_time - activation_time[i] > 1000 && valid[i])
+            // 检修优化: 检修模式下跳过"键轴损坏"判定 —— 检修时人为拨动/压住键轴是常态,
+            //   不该被判损坏。而且 valid[] 的自恢复条件要求状态是 IDLE/DEBUG, 检修期间被判 false
+            //   的通道本来就不会自恢复, 等于在检修时永久废掉该路。
+            if (!in_maint_window && state.LED_Strip_State != LED_STRIP_MAINTENANCE
+                && io_valid_state[i] == 0 && current_time - activation_time[i] > 1000 && valid[i])
             {
                 valid[i] = false;
                 ESP_LOGI(TAG_ARMOUR, "GPIO %d damaged: Low level detected for too long.", TRIGGER_IO[i]);
@@ -450,7 +481,9 @@ void PowerRune_Armour::GPIO_polling_service(void *pvParameter)
             }
             */
 
-            if ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_time) > 3000) // 预留3s供检修模式连击检测
+            // 检修优化: 上报门限与检修检测窗口对齐(原来是 3000)。窗口从 3s 放宽到 10s 后,
+            //   如果这里还留 3000, 3~10s 这段就会"边进检修边把连击当成真实命中上报给主控"。
+            if ((xTaskGetTickCount() * portTICK_PERIOD_MS - start_time) > MAINT_WINDOW_MS) // 窗口内不记分
             {
                 if (io_valid_state[i] == 0 && valid[i] && io_last_valid_state[i] == 1) // 下升沿触发，保证实时性
                 {
@@ -584,6 +617,10 @@ void PowerRune_Armour::blink()
 void PowerRune_Armour::enter_maintenance()
 {
     ESP_LOGI(TAG_ARMOUR, "Enter Maintenance Mode - All LEDs ON");
+    // 检修优化: 清掉激活进度。否则退出检修回到 IDLE 时, 若本轮是大符且 activation_total>0,
+    //   IDLE 会画出一条上一轮残留的进度条。
+    activation_progress = 0;
+    activation_total = 0;
     state.LED_Strip_State = LED_STRIP_MAINTENANCE;
     xSemaphoreGive(LED_Strip_FSM_Semaphore);
 }
